@@ -66,7 +66,7 @@ fn round_3() {
 }
 
 fn main() {
-    setup();
+    // setup();
     round_1();
     round_2();
     round_3();
