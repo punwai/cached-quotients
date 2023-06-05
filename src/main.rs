@@ -88,7 +88,7 @@ fn extended_bases_to_coeffs(n: usize, evals: &[F], cofactor: &F) -> Vec<F> {
     domain.ifft(&evals)
         .iter()
         .enumerate()
-        .map(|(i, x)| x * &cofactor.pow(vec![i as u64]))
+        .map(|(i, x)| x * &inv_offset.pow(vec![i as u64]))
         .collect::<Vec<_>>()
 }
 
@@ -126,18 +126,18 @@ fn setup(N: u64, t: &Vec<F>) -> GenOutput {
     let t_shifted = extend_lagrange_basis(N as usize, &t, &cofactor);
 
 
-    let w = F::one();
-    let mut w_ptr = domain.group_gen();
+    let w = domain.group_gen();
+    let mut w_ptr = F::one();
     let mut committed_quotients = vec![];
     let mut qis = vec![];
 
     for i in 0..(N as usize) {
-        let Z_V = (w * cofactor) / &F::from(N);
+        let Z_V = w_ptr / &F::from(N);
         let mut w_inner_ptr = F::one();
         let mut q_evals = vec![];
 
         for j in 0..t_shifted.len() {
-            let eval = (t_shifted[j] - t[i]) / (Z_V * (w_inner_ptr * cofactor - w_ptr));
+            let eval = ((t_shifted[j] - t[i]) / (w_inner_ptr * cofactor - w_ptr)) * Z_V;
             q_evals.push(eval);
             w_inner_ptr *= w;
         }
@@ -284,7 +284,7 @@ fn round_2(f: &Vec<F>, t: &Vec<F>, transcript: &mut Transcript, gen: &GenOutput)
     }
 }
 
-fn round_2_verify(round_1_msg: &Round1Message, round_2_msg: &Round2Message, transcript: &Transcript, gen: &GenOutput) {
+fn round_2_verify(n: u64, round_1_msg: &Round1Message, round_2_msg: &Round2Message, transcript: &Transcript, gen: &GenOutput) {
     // Perform the first check
     let l_pairing = Bls12_381::pairing(round_2_msg.a, &gen.t_commit);
     let r_pairing = Bls12_381::pairing(round_2_msg.q_a, &gen.z_commit)
@@ -292,7 +292,14 @@ fn round_2_verify(round_1_msg: &Round1Message, round_2_msg: &Round2Message, tran
     assert_eq!(l_pairing, r_pairing);
 
     // Perform the second check
-    // let l2_pairing = Bls12_381::pairing();
+    let N = gen.N;
+    let l2_pairing = Bls12_381::pairing(
+        round_2_msg.b_0_commit, &gen.srs.g2s[(N - 1 - (n - 2)) as usize]
+    );
+    let r2_pairing = Bls12_381::pairing(
+        round_2_msg.p_commit, G2::generator()
+    );
+    assert_eq!(l2_pairing, r2_pairing);
 }
 
 fn round_3(f: &Vec<F>, t: &Vec<F>, transcript: &mut Transcript, gen: &GenOutput) {
@@ -382,7 +389,6 @@ mod tests {
 
         // test cached quotient correctness
         for (ix, qi) in gen.qis.iter().enumerate() {
-            println!("first one");
             assert_eq!(qi.mul_by_vanishing_poly(domain) + &gen.Lis[ix] * t_vec[ix], &gen.Lis[ix] * &t_poly);
         }
     }
@@ -415,12 +421,12 @@ mod tests {
         let round_1_msg = round_1(&f_vec, &t_vec, &mut transcript, &gen);
         transcript.beta = Some(random_F());
         let round_2_msg = round_2(&f_vec, &t_vec, &mut transcript, &gen);
-        round_2_verify(&round_1_msg, &round_2_msg, &transcript, &gen);
+
+        let n = f_vec.len() as u64;
+        round_2_verify(n, &round_1_msg, &round_2_msg, &transcript, &gen);
 
         let N = t_vec.len();
         let n = f_vec.len();
         let domain = GeneralEvaluationDomain::<F>::new(n).unwrap();
-
-        // 
     }
 }
