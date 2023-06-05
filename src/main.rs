@@ -7,13 +7,10 @@ use ark_std::{Zero, One};
 use std::{ops::{Mul, Sub, Neg}, time::Instant, iter::Map, collections::HashMap};
 use rand::{rngs::OsRng, Rng};
 
-
 struct TrustedSetupParams {
     g1s: Vec<G1>,
-    g2s: Vec<G2>
+    g2s: Vec<G2>,
 }
-
-// 
 
 impl TrustedSetupParams {
     fn new(table_size: u64) -> Self {
@@ -43,6 +40,13 @@ fn commit_g1(coeffs: &[F], srs: &TrustedSetupParams) -> G1 {
     ).unwrap()
 }
 
+fn commit_g1_lagrange(evals: &[F], gen: &GenOutput) -> G1 {
+    G1::msm(
+        &gen.Li_commits[..evals.len()].iter().map(|x| G1Affine::from(*x)).collect::<Vec<_>>(),
+        &evals
+    ).unwrap()
+}
+
 fn commit_g2(coeffs: &[F], srs: &TrustedSetupParams) -> G2 {
     G2::msm(
         &srs.g2s[..coeffs.len()].iter().map(|x| G2Affine::from(*x)).collect::<Vec<_>>(),
@@ -58,6 +62,7 @@ struct GenOutput {
     qi_commits: Vec<G1>,
     Li_commits: Vec<G1>,
     Li_shifted_commits: Vec<G1>,
+    Li_constants: Vec<F>,
     cofactor: F
 }
 
@@ -95,12 +100,17 @@ fn setup(N: u64, t: &Vec<F>) -> GenOutput {
     let t_commit = commit_g2(&T, &srs);
     let mut Li_commits = vec![];
     let mut Li_shifted_commits = vec![];
+    let mut Li_constants = vec![];
 
     for i in 0..(N as usize) {
         // Commit to the Lagrange polynomials
         let mut L_eval = vec![F::zero(); N as usize];
         L_eval[i] = F::one();
+
         let L_i = domain.ifft(&t);
+        let Li_constant = L_i[0];
+        Li_constants.push(Li_constant);
+
         Li_commits.push(commit_g1(&L_i, &srs));
         // Commit to (L_i(x) - L(0) / x)
         Li_shifted_commits.push(commit_g1(&L_i[1..(N as usize)], &srs)); // Compute Q_i(x)
@@ -141,19 +151,30 @@ fn setup(N: u64, t: &Vec<F>) -> GenOutput {
         qi_commits: committed_quotients, 
         Li_commits,
         Li_shifted_commits,
+        Li_constants,
         cofactor
     }
 }
 
 struct Transcript {
     // SPARSE LAGRANGIAN (index, value)
-    m: Option<Vec<(u64, F)>>
+    m: Option<Vec<(u64, F)>>,
+    b0: Option<DensePolynomial<F>>,
+    q_B: Option<DensePolynomial<F>>,
+    q_B_evals: Option<Vec<F>>,
+    gamma: Option<F>,
+    eta: Option<F>,
 }
 
 impl Transcript {
     fn new() -> Self {
         Self {
-            m: None
+            m: None,
+            b0: None,
+            gamma: None,
+            eta: None,
+            q_B: None,
+            q_B_evals: None,
         }
     }
 }
@@ -184,7 +205,7 @@ fn round_1(f: &Vec<F>, t: &Vec<F>, gen: &GenOutput, transcript: &mut Transcript)
     Round1Message { m: m_commit }
 }
 
-fn round_2(f: Vec<F>, t: Vec<F>, beta: F, transcript: &mut Transcript, gen: &GenOutput) -> Round2Message {
+fn round_2(f: &Vec<F>, t: &Vec<F>, beta: F, transcript: &mut Transcript, gen: &GenOutput) -> Round2Message {
     let m = transcript.m.clone().unwrap();
     let mut a_commit = G1::zero();
     for (ix, m_el) in m.iter() {
@@ -200,6 +221,7 @@ fn round_2(f: Vec<F>, t: Vec<F>, beta: F, transcript: &mut Transcript, gen: &Gen
     let b_evals = f.iter().map(|f_el| F::one() / (f_el + &beta)).collect::<Vec<_>>();
     let b_poly = domain.ifft(&b_evals);
     let b_0 = b_poly.clone().into_iter().skip(1).collect::<Vec<_>>();
+
     let b_0_committed = commit_g1(&b_0, &gen.srs);
     // Compute Q_B(X)W
     let n = f.len();
@@ -211,16 +233,43 @@ fn round_2(f: Vec<F>, t: Vec<F>, beta: F, transcript: &mut Transcript, gen: &Gen
     let q_B_evals = (0..n).map(|i| (extended_b[i] * (extended_f[i] + beta) - F::one()) / &extended_z[i]).collect::<Vec<_>>();
     // Instead of this we can actually do an MSM with the committed Lagrangian bases
     let q_B = domain.ifft(&q_B_evals);
+
     let q_B_commit = commit_g1(&q_B, &gen.srs);
     let N: usize = t.len();
     let mut P_poly = vec![F::zero(); N - 1 - (n - 2)];
-    P_poly.extend(b_0);
+    P_poly.extend(b_0.clone());
+
     let p_commit = commit_g1(&P_poly, &gen.srs);
+
+    transcript.b0 = Some(DensePolynomial { coeffs: b_0 });
+    transcript.q_B = Some(DensePolynomial { coeffs: q_B });
+    transcript.q_B_evals = Some(q_B_evals);
     Round2Message {  }
 }
 
-fn round_3() {
+fn round_3(f: &Vec<F>, transcript: &mut Transcript, gen: &GenOutput) {
+    let gamma = transcript.gamma.clone().unwrap();
+    let eta = transcript.eta.clone().unwrap();
+    let q_B = transcript.q_B.clone().unwrap();
+    let q_B_evals = transcript.q_B_evals.clone().unwrap();
 
+    let domain = GeneralEvaluationDomain::<F>::new(f.len()).unwrap();
+    let b0 = transcript.b0.clone().unwrap();
+    let f_poly = DensePolynomial { coeffs: domain.ifft(f) };
+
+    let f_eval = f_poly.evaluate(&gamma);
+    let b0_eval = b0.evaluate(&gamma);
+    
+    let a_0 = F::one();
+    let q_B_eval = q_B.evaluate(&gamma);
+
+    let v = b0_eval + eta * f_eval + eta * eta * q_B_eval;
+
+    let b0_evals = domain.ifft(&b0);
+
+    let roots = domain.elements();
+    let h_evals = 
+        domain.elements().enumerate().map(|(i, el)| (b0_evals[i] + eta * f[i] + eta * eta * q_B_evals[i]) / (el - eta)).collect::<Vec<_>>();
 }
 
 fn main() {
